@@ -3,11 +3,14 @@ package com.sahithi.jobscheduler.repository;
 import com.sahithi.jobscheduler.domain.Job;
 import com.sahithi.jobscheduler.domain.JobStatus;
 import java.sql.Timestamp;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
 import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
@@ -23,6 +26,8 @@ import org.springframework.stereotype.Repository;
  */
 @Repository
 public class JobRepository {
+
+    private static final Logger log = LoggerFactory.getLogger(JobRepository.class);
 
     private static final RowMapper<Job> JOB_ROW_MAPPER = (rs, rowNum) -> new Job(
             UUID.fromString(rs.getString("id")),
@@ -112,6 +117,48 @@ public class JobRepository {
                 """,
                 params,
                 JOB_ROW_MAPPER);
+    }
+
+    /**
+     * Returns jobs abandoned by dead workers to the queue. A claim is a <em>lease</em>, not a
+     * permanent assignment: a worker that is killed mid-job (OOM, pod eviction, power loss) never
+     * writes an outcome, leaving its rows RUNNING forever. Any RUNNING row whose {@code locked_at}
+     * is older than {@code leaseTimeout} is treated as abandoned.
+     *
+     * <p>Jobs with attempts remaining go back to PENDING; jobs that have already burned their last
+     * attempt are dead-lettered rather than requeued, so a "poison pill" job that reliably kills
+     * whichever worker picks it up can't take down the fleet one worker at a time.
+     *
+     * <p>Uses SKIP LOCKED for the same reason the claim query does: every worker runs this on its
+     * own schedule, so it has to be safe to execute concurrently from all of them.
+     *
+     * @return how many jobs this call recovered
+     */
+    public int reclaimExpiredLeases(Duration leaseTimeout) {
+        var params = new MapSqlParameterSource().addValue("timeoutSeconds", leaseTimeout.toSeconds());
+        var recovered = jdbc.update(
+                """
+                WITH expired AS (
+                    SELECT id FROM jobs
+                    WHERE status = 'RUNNING'
+                      AND locked_at < now() - make_interval(secs => :timeoutSeconds)
+                    FOR UPDATE SKIP LOCKED
+                )
+                UPDATE jobs
+                SET status = CASE WHEN attempts < max_attempts THEN 'PENDING' ELSE 'DEAD_LETTER' END,
+                    last_error = 'Worker lease expired - worker ' || COALESCE(locked_by, '?')
+                                 || ' did not report an outcome',
+                    locked_by = NULL,
+                    locked_at = NULL,
+                    next_run_at = now(),
+                    updated_at = now()
+                WHERE id IN (SELECT id FROM expired)
+                """,
+                params);
+        if (recovered > 0) {
+            log.warn("Reclaimed {} job(s) orphaned by workers that stopped reporting", recovered);
+        }
+        return recovered;
     }
 
     public void markSucceeded(UUID id) {

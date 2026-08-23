@@ -15,7 +15,11 @@ scheduler:
   execution-threads: 4
   backoff-base-seconds: 2
   backoff-max-seconds: 300
-  backoff-jitter-seconds: 2
+  # A claim is a lease: if a worker dies without reporting an outcome, its jobs are returned to
+  # the queue after this long. Must exceed the slowest legitimate job, or a slow job gets
+  # reclaimed and run a second time while the first attempt is still running.
+  lease-timeout-seconds: 300
+  reaper-interval-ms: 30000
 
 management:
   endpoints:

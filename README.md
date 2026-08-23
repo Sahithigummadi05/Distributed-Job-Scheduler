@@ -49,9 +49,41 @@ RETURNING *;
 A concurrency test that would pass with or without the mechanism it's meant to verify proves
 nothing — this one demonstrably has teeth.
 
+## Surviving worker crashes
+
+Safe claiming alone isn't enough. If a worker is killed mid-job — OOM kill, pod eviction, power
+loss — it never writes an outcome, so its rows sit in `RUNNING` with a `locked_by` that will never
+return. The queue looks healthy while work silently disappears.
+
+So a claim is a **lease**, not a permanent assignment. Every worker runs a reaper that returns
+jobs whose lease expired:
+
+```sql
+WITH expired AS (
+    SELECT id FROM jobs
+    WHERE status = 'RUNNING' AND locked_at < now() - make_interval(secs => :timeout)
+    FOR UPDATE SKIP LOCKED
+)
+UPDATE jobs
+SET status = CASE WHEN attempts < max_attempts THEN 'PENDING' ELSE 'DEAD_LETTER' END, ...
+```
+
+Three design decisions worth noting:
+
+- **Every worker reaps; there is no elected reaper.** A single designated reaper would be a
+  single point of failure — and if *it* were the process that died, nothing would recover its
+  jobs. Concurrent sweeps are safe for the same reason claiming is: `SKIP LOCKED`.
+- **An orphan with no attempts left is dead-lettered, not requeued.** A job that reliably kills
+  whichever worker picks it up (a "poison pill") would otherwise take down the fleet one worker
+  at a time.
+- **The lease timeout must exceed your slowest legitimate job**, or a slow job gets reclaimed and
+  run a second time while the first attempt is still in flight. That trade-off is the price of
+  crash recovery without a heartbeat protocol, and it's documented in the config.
+
 ## Features
 
 - **Exactly-once claiming** across arbitrarily many worker instances (the table above).
+- **Crash recovery** via lease expiry — jobs orphaned by dead workers are returned to the queue.
 - **Retries with exponential backoff + full jitter** — `random(0, min(cap, base·2ⁿ))`, the AWS
   algorithm, so a batch of jobs failing together doesn't retry in lockstep (thundering herd).
   Capped so a repeatedly-failing job isn't scheduled years out; overflow-guarded for large N.
@@ -62,8 +94,31 @@ nothing — this one demonstrably has teeth.
 - **Priority scheduling and delayed jobs** — `priority DESC` ordering, `next_run_at` for
   scheduling work in the future.
 - **REST API** for enqueueing and inspecting jobs, plus queue-depth stats.
+- **Metrics** via Micrometer — `jobs.succeeded`, `jobs.retried`, `jobs.deadlettered` (tagged by job
+  type), execution-duration timers, and a `jobs.queue.depth` gauge per status. Backlog and
+  dead-letter count are what you'd actually alert on.
 - **Health/readiness/liveness probes** via Spring Actuator — ready for a Kubernetes deployment.
 - **Graceful shutdown** — in-flight jobs drain (up to 30s) before the worker pool closes.
+
+## Measured throughput
+
+End-to-end (claim → execute → record outcome), 2,000 jobs with a no-op handler, so the number
+reflects the scheduler's own overhead rather than whatever a real handler does. Run it yourself
+with `mvn test -Dtest=ThroughputBenchmarkTest`:
+
+| Workers | Elapsed | Jobs/sec |
+|---:|---:|---:|
+| 1 | 622 ms | 3,215 |
+| 2 | 355 ms | 5,634 |
+| 4 | 246 ms | 8,130 |
+| 8 | 186 ms | 10,753 |
+| 16 | 159 ms | 12,579 |
+
+Throughput scales with worker count, but **sub-linearly, and it flattens** — 16× the workers buys
+roughly 4× the throughput. That's the expected shape, not a defect: with a no-op handler every
+worker is contending on the same database, so the database becomes the bottleneck well before the
+workers do. The benchmark asserts all 2,000 jobs completed exactly once at every worker count, so
+these are throughput numbers for *correct* execution, not just SQL round-trips.
 
 ## Architecture
 
@@ -85,11 +140,12 @@ running more of them, with no configuration change and nothing to elect.
 
 | Package | Responsibility |
 |---|---|
-| `repository` | All coordination SQL, including the atomic claim |
+| `repository` | All coordination SQL — the atomic claim and the lease reclaim |
 | `retry` | `RetryPolicy` — pure backoff-with-jitter function, no Spring/clock/IO |
-| `worker` | `JobPoller` (polling loop, bounded thread pool) and `JobExecutor` (run + outcome) |
+| `worker` | `JobPoller` (polling loop), `JobExecutor` (run + outcome), `LeaseReaper` (crash recovery) |
 | `handler` | `JobHandler` interface — implement + register as a bean to handle a job type |
 | `api` | REST controller |
+| `config` | Properties, bean wiring, queue-depth metrics |
 
 ## Running it
 
@@ -115,6 +171,11 @@ curl -X POST http://localhost:8080/api/jobs \
 curl http://localhost:8080/api/jobs/stats            # queue depth by status
 curl 'http://localhost:8080/api/jobs?status=DEAD_LETTER'   # inspect failures
 curl http://localhost:8080/actuator/health           # liveness/readiness
+
+# Metrics
+curl http://localhost:8080/actuator/metrics/jobs.succeeded
+curl http://localhost:8080/actuator/metrics/jobs.deadlettered
+curl http://localhost:8080/actuator/metrics/jobs.queue.depth
 ```
 
 ## Adding a job type
@@ -136,14 +197,21 @@ public class SendEmailHandler implements JobHandler {
 mvn verify
 ```
 
-20 tests, run in CI on every push against a real PostgreSQL service container.
+31 tests, run in CI on every push against a real PostgreSQL service container.
 
 Tests run against **real PostgreSQL, never an embedded database** — `FOR UPDATE SKIP LOCKED` is
 the entire mechanism under test and H2/HSQLDB don't implement it faithfully, so a green test on an
-embedded database would be measuring nothing. The suite covers: the 20-worker concurrency
-property, the naive-implementation counter-proof, retry/backoff bounds and jitter distribution,
-overflow safety at large attempt counts, the full retry → dead-letter lifecycle, unknown-handler
-handling, dedupe-key idempotency, priority ordering, and future-scheduled jobs not being claimed early.
+embedded database would be measuring nothing. The suite covers:
+
+- **Concurrency** — the 20-worker exactly-once property, plus the naive-implementation counter-proof
+- **Crash recovery** — orphaned jobs reclaimed, in-flight jobs left alone, poison pills
+  dead-lettered, and concurrent reaping recovering each job exactly once
+- **Retry** — backoff bounds, jitter actually varying, overflow safety at large attempt counts,
+  and the full retry → dead-letter lifecycle
+- **Semantics** — dedupe-key idempotency, priority ordering, future-scheduled jobs not claimed
+  early, unknown job types dead-lettering immediately rather than retrying pointlessly
+- **API** — enqueue, validation, idempotency, lookup, filtering, stats
+- **Throughput** — measured across 1–16 workers, asserting correctness at every level
 
 ## Tech
 

@@ -16,6 +16,8 @@ scheduler:
   execution-threads: 4
   backoff-base-seconds: 1
   backoff-max-seconds: 10
+  lease-timeout-seconds: 300
+  reaper-interval-ms: 30000
   # The concurrency tests drive claimBatch directly; a background poller would race with them
   # and steal the very rows under test.
   polling-enabled: false
