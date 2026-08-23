@@ -45,8 +45,15 @@ RETURNING *;
 
 | Implementation | Workers | Jobs | Total claims | Duplicate claims |
 |---|---|---|---|---|
-| Naive `SELECT`-then-`UPDATE` | 16 | 300 | 1,890 | **1,590** |
+| Naive `SELECT`-then-`UPDATE` | 16 | 300 | 1,520 – 1,900 | **1,220 – 1,600** |
 | `FOR UPDATE SKIP LOCKED` | 20 | 500 | 500 | **0** |
+
+The naive row is a range because the amount of duplication depends on how threads happen to
+interleave — it varied across four consecutive runs. The exact count isn't the point and quoting
+one run as if it were a constant would be misleading. What matters is the qualitative gap, and
+that part is not noisy: **the naive version always duplicates heavily, and `SKIP LOCKED` is always
+exactly zero.** Zero is deterministic here, not a lucky run — it's the property the lock
+guarantees.
 
 `NaiveClaimingIsUnsafeTest` asserts the broken version *does* double-claim; that's deliberate.
 A concurrency test that would pass with or without the mechanism it's meant to verify proves
