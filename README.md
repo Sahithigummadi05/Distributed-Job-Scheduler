@@ -3,8 +3,11 @@
 ![CI](https://github.com/Sahithigummadi05/project2/actions/workflows/ci.yml/badge.svg)
 
 A horizontally-scalable background job scheduler in Java 21 / Spring Boot, where **many worker
-instances poll one PostgreSQL database and provably never process the same job twice** — no
+instances poll one PostgreSQL database and provably never claim the same job concurrently** — no
 message broker, no distributed lock service, no leader election.
+
+Delivery is **at-least-once**, not exactly-once. That distinction is deliberate and explained in
+[Delivery semantics](#delivery-semantics-at-least-once-not-exactly-once) below.
 
 Coordination is done in SQL, using `SELECT ... FOR UPDATE SKIP LOCKED`, the same approach
 production job queues built on Postgres use (Oban, pg-boss, GoodJob, Sidekiq's Postgres variants).
@@ -80,9 +83,49 @@ Three design decisions worth noting:
   run a second time while the first attempt is still in flight. That trade-off is the price of
   crash recovery without a heartbeat protocol, and it's documented in the config.
 
+## Delivery semantics: at-least-once, not exactly-once
+
+**Claiming is exactly-once. Execution is at-least-once.** Those are different guarantees and the
+distinction matters, so it's worth being precise about what this system does and does not promise.
+
+The claim query guarantees no two workers ever hold the same job at the same time — that's the
+property the concurrency tests verify. But consider this interleaving:
+
+1. Worker A claims job X and runs it to completion — the email is sent, the payment is charged.
+2. Worker A is killed *before* it can write `status = 'SUCCEEDED'`.
+3. The lease expires. The reaper sees a `RUNNING` job with no live owner and requeues it.
+4. Worker B claims job X and runs it again. The email is sent twice.
+
+No amount of locking fixes this. The work (an external side effect) and the bookkeeping (a row
+update) are in two different systems, so there is no atomic commit spanning both. Closing the gap
+genuinely requires either a distributed transaction across your side effect and the database, or
+transactional outbox/two-phase commit — both a large step up in complexity.
+
+So this scheduler makes the same trade every mainstream job queue makes. **Sidekiq, Celery, AWS
+SQS, and Oban are all at-least-once for exactly this reason.** The industry-standard resolution is
+to push idempotency to the handler rather than pretend the queue can provide it:
+
+```java
+public void handle(Job job) {
+    // Derive a stable key from the job, not from the attempt.
+    if (alreadyProcessed(job.id())) return;
+    chargeCustomer(...);
+    recordProcessed(job.id());
+}
+```
+
+**Handlers must be idempotent.** The scheduler makes that cheap — `job.id()` is stable across
+retries and reclaims, so it works directly as a deduplication key. Enqueue-side idempotency is
+handled separately by `dedupeKey` (a partial unique index), which prevents the same logical job
+from entering the queue twice in the first place.
+
+Anyone claiming exactly-once execution for a queue like this is either wrong or quietly redefining
+"execution" to mean "claiming."
+
 ## Features
 
-- **Exactly-once claiming** across arbitrarily many worker instances (the table above).
+- **Exactly-once claiming** across arbitrarily many worker instances (the table above) —
+  with at-least-once *execution*, per [Delivery semantics](#delivery-semantics-at-least-once-not-exactly-once).
 - **Crash recovery** via lease expiry — jobs orphaned by dead workers are returned to the queue.
 - **Retries with exponential backoff + full jitter** — `random(0, min(cap, base·2ⁿ))`, the AWS
   algorithm, so a batch of jobs failing together doesn't retry in lockstep (thundering herd).
@@ -102,17 +145,37 @@ Three design decisions worth noting:
 
 ## Measured throughput
 
-End-to-end (claim → execute → record outcome), 2,000 jobs with a no-op handler, so the number
-reflects the scheduler's own overhead rather than whatever a real handler does. Run it yourself
-with `mvn test -Dtest=ThroughputBenchmarkTest`:
+End-to-end (claim → execute → record outcome), 2,000 jobs with a no-op handler, so the numbers
+reflect the scheduler's own overhead rather than whatever a real handler does. Run it yourself
+with `mvn test -Dtest=ThroughputBenchmarkTest`.
 
-| Workers | Elapsed | Jobs/sec |
-|---:|---:|---:|
-| 1 | 622 ms | 3,215 |
-| 2 | 355 ms | 5,634 |
-| 4 | 246 ms | 8,130 |
-| 8 | 186 ms | 10,753 |
-| 16 | 159 ms | 12,579 |
+Ranges below are the min–max across repeated consecutive runs on one containerized dev box
+(shared CPU, PostgreSQL on the same host):
+
+| Workers | Jobs/sec (observed range) |
+|---:|---:|
+| 1 | 1,200 – 3,200 |
+| 2 | 2,400 – 5,600 |
+| 4 | 4,100 – 8,100 |
+| 8 | 4,100 – 10,800 |
+| 16 | 4,500 – 12,600 |
+
+**Ranges, not point values, because the spread is real:** identical back-to-back runs varied by up
+to ~2.5×, and at 16 workers one run came in *below* its own 8-worker result. Reporting a single
+flattering number here would be measurement theater — on shared infrastructure the absolute
+figures say more about what else the box was doing than about the scheduler.
+
+What *is* stable across every run is the shape:
+
+- **Scaling is real but sub-linear.** 1 → 4 workers reliably gives roughly 3–3.5×.
+- **It flattens past ~8 workers, then becomes noise-dominated.** With a no-op handler every worker
+  contends on the same database, so the database saturates well before the workers do. Beyond that
+  point, added workers buy contention rather than throughput.
+- **Correctness holds at every level.** The benchmark asserts all 2,000 jobs completed exactly
+  once at each worker count, so these measure *correct* execution, not just SQL round-trips.
+
+For a real workload the useful conclusion isn't the headline number — it's that the bottleneck is
+the database, so scaling past a handful of workers per database is the wrong lever.
 
 Throughput scales with worker count, but **sub-linearly, and it flattens** — 16× the workers buys
 roughly 4× the throughput. That's the expected shape, not a defect: with a no-op handler every
