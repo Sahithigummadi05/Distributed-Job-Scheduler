@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: jobscheduler_test
+          POSTGRES_USER: jobscheduler
+          POSTGRES_PASSWORD: jobscheduler
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U jobscheduler"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: "21"
+          distribution: temurin
+          cache: maven
+
+      - name: Build and test
+        run: mvn -B verify
+        env:
+          TEST_DB_HOST: localhost
+          TEST_DB_PORT: 5432
+          TEST_DB_NAME: jobscheduler_test
+          TEST_DB_USER: jobscheduler
+          TEST_DB_PASSWORD: jobscheduler

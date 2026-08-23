@@ -1,0 +1,25 @@
+spring:
+  datasource:
+    url: jdbc:postgresql://${TEST_DB_HOST:localhost}:${TEST_DB_PORT:5432}/${TEST_DB_NAME:jobscheduler_test}
+    username: ${TEST_DB_USER:jobscheduler}
+    password: ${TEST_DB_PASSWORD:jobscheduler}
+    hikari:
+      maximum-pool-size: 32
+  flyway:
+    enabled: true
+    clean-disabled: false
+
+scheduler:
+  worker-id: test-worker
+  poll-interval-ms: 100
+  batch-size: 10
+  execution-threads: 4
+  backoff-base-seconds: 1
+  backoff-max-seconds: 10
+  # The concurrency tests drive claimBatch directly; a background poller would race with them
+  # and steal the very rows under test.
+  polling-enabled: false
+
+logging:
+  level:
+    com.sahithi.jobscheduler: WARN

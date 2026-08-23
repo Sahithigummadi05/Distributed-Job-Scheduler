@@ -1,0 +1,32 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: jobscheduler
+      POSTGRES_USER: jobscheduler
+      POSTGRES_PASSWORD: jobscheduler
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U jobscheduler"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Two workers against one database - the point of the design. Scale further with
+  # `docker compose up --scale worker=5`; no coordination config changes are needed, because
+  # claiming is enforced in SQL rather than by the application.
+  worker:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DB_HOST: postgres
+      DB_NAME: jobscheduler
+      DB_USER: jobscheduler
+      DB_PASSWORD: jobscheduler
+    deploy:
+      replicas: 2
+    ports:
+      - "8080-8081:8080"
