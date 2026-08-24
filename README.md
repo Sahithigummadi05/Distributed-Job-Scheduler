@@ -1,6 +1,6 @@
 # Distributed Job Scheduler
 
-![CI](https://github.com/Sahithigummadi05/project2/actions/workflows/ci.yml/badge.svg)
+[![CI](https://github.com/Sahithigummadi05/project2/actions/workflows/ci.yml/badge.svg)](https://github.com/Sahithigummadi05/project2/actions/workflows/ci.yml)
 
 A horizontally-scalable background job scheduler in Java 21 / Spring Boot, where **many worker
 instances poll one PostgreSQL database and provably never claim the same job concurrently** — no
